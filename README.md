@@ -46,6 +46,16 @@ Pensando nisso nós desenvolvemos um sistema integrado a bicicleta que fornecer�
 ![image](https://user-images.githubusercontent.com/72897285/200328260-e16c1aec-4766-4971-a09e-626ff67d540b.png)
 
 
+### Vídeo explicativo sobre o protótipo
+
+<div align="center">
+<table>
+ 
+[![Watch the video](https://user-images.githubusercontent.com/72897285/200366883-dd151c9c-d6e4-48d3-9700-ca1e23d41b46.png)](https://www.youtube.com/watch?v=b49Bcf9cohY)
+
+</table>
+</div>
+
 ### Proposta UX 1 - C
 
 > - Mockup da interface:
