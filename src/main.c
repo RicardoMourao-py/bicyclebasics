@@ -4,25 +4,28 @@
 
 #include <asf.h>
 #include <string.h>
+#include "arm_math.h"
 #include "ili9341.h"
 #include "lvgl.h"
 #include "touch/touch.h"
+#include "bicyclebasics.h"
 LV_FONT_DECLARE(dseg70);
 LV_FONT_DECLARE(dseg50);
 LV_FONT_DECLARE(dseg20);
 
+#define SENSOR_PIO PIOA
+#define SENSOR_PIO_ID ID_PIOA
+#define SENSOR_IDX 19
+#define SENSOR_IDX_MASK (1u << SENSOR_IDX)
 
 // global
-static  lv_obj_t * labelBtn1;
-static  lv_obj_t * labelMenu;
-static  lv_obj_t * labelClk;
-static  lv_obj_t * labelUp;
-static  lv_obj_t * labelDown;
-
 static lv_obj_t * label_PlayPause;
 static lv_obj_t * label_Restart;
 static lv_obj_t * label_PassarTelaDireita;
 static lv_obj_t * labelTempo;
+static lv_obj_t * label_TempoPercorrido;
+static lv_obj_t * labelVelocidade;
+static lv_obj_t * labelDistancia;
 
 
 static lv_obj_t * labelFloor;
@@ -30,12 +33,11 @@ static lv_obj_t * labelFloor50;
 static lv_obj_t * labelFloor20;
 
 // filas
-QueueHandle_t xQueueAnalogicData;
-QueueHandle_t xQueueRealTemp;
 QueueHandle_t xQueueRTC;
+QueueHandle_t xQueueDeltaT;
 // semáforos
 SemaphoreHandle_t xSemaphoreClock;
-SemaphoreHandle_t xSemaphore;
+SemaphoreHandle_t xSemaphoreMutex;
 
 
 typedef struct {
@@ -48,8 +50,7 @@ typedef struct {
 	uint32_t second;
 } calendar;
 
-uint32_t current_hour, current_min, current_sec;
-uint32_t current_year, current_month, current_day, current_week;
+calendar rtc_initial = {2022, 3, 19, 12, 8, 22 , 0};
 
 
 /************************************************************************/
@@ -75,6 +76,9 @@ static lv_indev_drv_t indev_drv;
 #define TASK_LCD_STACK_SIZE                (1024*6/sizeof(portSTACK_TYPE))
 #define TASK_LCD_STACK_PRIORITY            (tskIDLE_PRIORITY)
 
+#define TASK_VELOCIDADE_STACK_SIZE                (1024/sizeof(portSTACK_TYPE))
+#define TASK_VELOCIDADE_STACK_PRIORITY            (tskIDLE_PRIORITY)
+
 
 extern void vApplicationStackOverflowHook(xTaskHandle *pxTask,  signed char *pcTaskName);
 extern void vApplicationIdleHook(void);
@@ -98,45 +102,32 @@ extern void vApplicationMallocFailedHook(void) {
 
 
 void RTC_init(Rtc *rtc, uint32_t id_rtc, calendar t, uint32_t irq_type);
-
+void io_init(void);
+static void RTT_init(float freqPrescale, uint32_t IrqNPulses, uint32_t rttIRQSource);
 
 /************************************************************************/
 /* lvgl                                                                 */
 /************************************************************************/
-// void RTC_Handler(void) {
-// 	uint32_t ul_status = rtc_get_status(RTC);
-// 
-// 	/* seccond tick */
-// 	if ((ul_status & RTC_SR_SEC) == RTC_SR_SEC) {
-// 		// o c?digo para irq de segundo vem aqui
-// 		// libera o semáforo para atualizar o relógio
-// 		BaseType_t xHigherPriorityTaskWoken = pdTRUE;
-// 		xSemaphoreGiveFromISR(xSemaphoreClock, &xHigherPriorityTaskWoken);
-// 	}
-// 
-// 	rtc_clear_status(RTC, RTC_SCCR_SECCLR);
-// 	rtc_clear_status(RTC, RTC_SCCR_ALRCLR);
-// 	rtc_clear_status(RTC, RTC_SCCR_ACKCLR);
-// 	rtc_clear_status(RTC, RTC_SCCR_TIMCLR);
-// 	rtc_clear_status(RTC, RTC_SCCR_CALCLR);
-// 	rtc_clear_status(RTC, RTC_SCCR_TDERRCLR);
-// }
+void velocidade_callback(void){
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	int dt = rtt_read_timer_value(RTT);
+	xQueueSendFromISR(xQueueDeltaT, &dt, &xHigherPriorityTaskWoken);
+	RTT_init(1000,0,NULL);
+}
+
 
 void RTC_Handler(void) {
 	uint32_t ul_status = rtc_get_status(RTC);
-
-
 	
 	/* Time or date alarm */
 	if ((ul_status & RTC_SR_ALARM) == RTC_SR_ALARM) {
 		
 	}
-	
 
 	if ((ul_status & RTC_SR_SEC) == RTC_SR_SEC) {
 		
 		BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-		xSemaphoreGiveFromISR(xSemaphore, &xHigherPriorityTaskWoken);
+		xSemaphoreGiveFromISR(xSemaphoreClock, &xHigherPriorityTaskWoken);
 		//rtc_clear_status(RTC, RTC_SCCR_SECCLR);
 	}
 	
@@ -263,80 +254,33 @@ void lv_termostato(void) {
 	
 	// Tempo
 	labelTempo = lv_label_create(lv_scr_act());
-	lv_obj_align(labelTempo, LV_ALIGN_TOP_MID, 0 , 0);
-	lv_obj_set_style_text_font(labelTempo, &dseg70, LV_STATE_DEFAULT);
+	lv_obj_align(labelTempo, LV_ALIGN_TOP_MID, 0 , 80);
+	lv_obj_set_style_text_font(labelTempo, &dseg20, LV_STATE_DEFAULT);
 	lv_obj_set_style_text_color(labelTempo, lv_color_white(), LV_STATE_DEFAULT);
-// 	lv_label_set_text_fmt(labelTempo, "%02d", 23);
+	lv_label_set_text_fmt(labelTempo, "%02d:%02d:%02d", rtc_initial.hour, rtc_initial.minute, rtc_initial.second);
 	
+	// Tempo percorrido
+	label_TempoPercorrido = lv_label_create(lv_scr_act());
+	lv_obj_align(label_TempoPercorrido, LV_ALIGN_LEFT_MID, 8 , 20);
+	lv_obj_set_style_text_font(label_TempoPercorrido, &dseg20, LV_STATE_DEFAULT);
+	lv_obj_set_style_text_color(label_TempoPercorrido, lv_color_white(), LV_STATE_DEFAULT);
+	lv_label_set_text_fmt(label_TempoPercorrido, "%02d:%02d", 0, 0);
 	
-	// BOTÃO 1 - POWER
-// 	lv_obj_t * btn1 = lv_btn_create(lv_scr_act());
-// 	lv_obj_add_event_cb(btn1, event_handler, LV_EVENT_ALL, NULL);
-// 	lv_obj_align(btn1, LV_ALIGN_BOTTOM_LEFT, 8, -20);
-// 	lv_obj_add_style(btn1, &style, 0);
-// 
-// 	labelBtn1 = lv_label_create(btn1);
-// 	lv_label_set_text(labelBtn1, "[  " LV_SYMBOL_POWER);
-// 	lv_obj_center(labelBtn1);
-// 	
-// 	// BOTÃO MENU
-// 	lv_obj_t * btnMenu = lv_btn_create(lv_scr_act());
-// 	lv_obj_add_event_cb(btnMenu, menu_handler, LV_EVENT_ALL, NULL);
-// 	lv_obj_align_to(btnMenu, btn1, LV_ALIGN_OUT_RIGHT_MID, 0, -10);
-// 	lv_obj_add_style(btnMenu, &style, 0);
-// 
-// 	labelMenu = lv_label_create(btnMenu);
-// 	lv_label_set_text(labelMenu, "|  M");
-// 	lv_obj_center(labelMenu);
-// 	
-// 	// BOTÃO CLOCK
-// 	lv_obj_t * btnClk = lv_btn_create(lv_scr_act());
-// 	lv_obj_add_event_cb(btnClk, menu_handler, LV_EVENT_ALL, NULL);
-// 	lv_obj_align_to(btnClk, btnMenu, LV_ALIGN_OUT_RIGHT_MID, 0, -10);
-// 	lv_obj_add_style(btnClk, &style, 0);
-// 
-// 	labelClk = lv_label_create(btnClk);
-// 	lv_label_set_text(labelClk, "|  " LV_SYMBOL_SETTINGS "  ]");
-// 	lv_obj_center(labelClk);
-// 	
-// 	// BOTÃO UP
-// 	lv_obj_t * btnuP = lv_btn_create(lv_scr_act());
-// 	lv_obj_add_event_cb(btnuP, event_handler, LV_EVENT_ALL, NULL);
-// 	lv_obj_align(btnuP, LV_ALIGN_BOTTOM_RIGHT, -68, -20);
-// 	lv_obj_add_style(btnuP, &style, 0);
-// 
-// 	labelUp = lv_label_create(btnuP);
-// 	lv_label_set_text(labelUp, "[  " LV_SYMBOL_UP);
-// 	lv_obj_center(labelUp);
-// 	
-// 	// BOTÃO DOWN
-// 	lv_obj_t * btnDown = lv_btn_create(lv_scr_act());
-// 	lv_obj_add_event_cb(btnDown, menu_handler, LV_EVENT_ALL, NULL);
-// 	lv_obj_align_to(btnDown, btnuP, LV_ALIGN_OUT_RIGHT_MID, 0, -10);
-// 	lv_obj_add_style(btnDown, &style, 0);
-// 
-// 	labelDown = lv_label_create(btnDown);
-// 	lv_label_set_text(labelDown, "|  " LV_SYMBOL_DOWN "  ]");
-// 	lv_obj_center(labelDown);
-// 	
-// 	/////////
-// 	labelFloor = lv_label_create(lv_scr_act());
-// 	lv_obj_align(labelFloor, LV_ALIGN_LEFT_MID, 35 , -45);
-// 	lv_obj_set_style_text_font(labelFloor, &dseg70, LV_STATE_DEFAULT);
-// 	lv_obj_set_style_text_color(labelFloor, lv_color_white(), LV_STATE_DEFAULT);
-// 	lv_label_set_text_fmt(labelFloor, "%02d", 23);
-// 
-// 	labelFloor50 = lv_label_create(lv_scr_act());
-// 	lv_obj_align(labelFloor50, LV_ALIGN_RIGHT_MID, -10 , -35);
-// 	lv_obj_set_style_text_font(labelFloor50, &dseg50, LV_STATE_DEFAULT);
-// 	lv_obj_set_style_text_color(labelFloor50, lv_color_white(), LV_STATE_DEFAULT);
-// 	lv_label_set_text_fmt(labelFloor50, "%02d", 22);
-// 	
-// 	labelFloor20 = lv_label_create(lv_scr_act());
-// 	lv_obj_align(labelFloor20, LV_ALIGN_TOP_RIGHT, -10 , 5);
-// 	lv_obj_set_style_text_font(labelFloor20, &dseg20, LV_STATE_DEFAULT);
-// 	lv_obj_set_style_text_color(labelFloor20, lv_color_white(), LV_STATE_DEFAULT);
-// 	lv_label_set_text_fmt(labelFloor20, "%02d:%02d", 17,46);
+	// Velocidade
+	labelVelocidade = lv_label_create(lv_scr_act());
+	lv_obj_align(labelVelocidade, LV_ALIGN_CENTER, 0 , 20);
+	lv_obj_set_style_text_font(labelVelocidade, &dseg20, LV_STATE_DEFAULT);
+	lv_obj_set_style_text_color(labelVelocidade, lv_color_black(), LV_STATE_DEFAULT);
+	lv_label_set_text_fmt(labelVelocidade, "%d", 4);
+	
+	// Distância
+	labelDistancia = lv_label_create(lv_scr_act());
+	lv_obj_align(labelDistancia, LV_ALIGN_RIGHT_MID, -8 , 20);
+	lv_obj_set_style_text_font(labelDistancia, &dseg20, LV_STATE_DEFAULT);
+	lv_obj_set_style_text_color(labelDistancia, lv_color_white(), LV_STATE_DEFAULT);
+	lv_label_set_text_fmt(labelDistancia, "%02d.%01d", 0, 0);
+	
+
 }
 /************************************************************************/
 /* TASKS                                                                */
@@ -344,45 +288,122 @@ void lv_termostato(void) {
 
 static void task_lcd(void *pvParameters) {
 	int px, py;
-	printf("cheguei\n");
 	//lv_ex_btn_1();
+	lv_obj_t * img = lv_img_create(lv_scr_act());
+	lv_img_set_src(img, &bicyclebasics);
+	lv_obj_align(img, LV_ALIGN_TOP_MID, 0, 0);
+	
 	lv_termostato();
 
 	for (;;)  {
+		xSemaphoreGive(xSemaphoreMutex);
 		lv_tick_inc(50);
 		lv_task_handler();
+		xSemaphoreTake(xSemaphoreMutex, 0);
 		vTaskDelay(50);
 	}
 }
 
 static void task_RTC(void *pvParameters) {
-	calendar rtc_initial = {2018, 3, 19, 12, 1, 1 ,1};
+	
 	RTC_init(RTC, ID_RTC, rtc_initial, RTC_IER_ALREN | RTC_IER_SECEN);
 	uint32_t hour;
 	uint32_t minute;
 	uint32_t second;
-	UNUSED(pvParameters);
+	int minutoPassado = 0;
 	
-	int x;
-	char teste[100];
-	printf("cheguei rtc\n");
+	io_init();
+	RTT_init(1000,0,NULL);
 	
+	int vel_antiga = 0;
+	float raio = 0.508/2;
+	int dt;
+	float v;
+	float cte = 2*PI*raio*3.6*0.92*1000;
+		
 	for (;;) {
-// 		printf("1");
-// 		if( xSemaphoreTake(xSemaphore, ( TickType_t ) 10 / portTICK_PERIOD_MS) == pdTRUE ) {
-		rtc_get_time(RTC, &hour, &minute, &second);
-		printf("1");
-		lv_label_set_text_fmt(labelTempo, "%02d : %02d",hour,minute);
-		delay_s(1);
-// 		}
-
+		if( xSemaphoreTake(xSemaphoreClock, ( TickType_t ) 10 / portTICK_PERIOD_MS)) {
+			rtc_get_time(RTC, &hour, &minute, &second);
+			lv_label_set_text_fmt(labelTempo, "%02d:%02d:%02d", hour, minute, second);
+			lv_label_set_text_fmt(label_TempoPercorrido, "%02d:%02d", minutoPassado, second);
+			if (second == 59)
+				minutoPassado++;
+		}
+		
+		if (xQueueReceive(xQueueDeltaT, &dt, 0)) {
+			v = cte/dt;
+			printf("%d\n",(int) dt);
+			lv_label_set_text_fmt(labelVelocidade, "%.1f",   v);
+			// Acelerou
+			if (v > vel_antiga)
+			lv_obj_set_style_text_color(labelVelocidade, lv_color_make(0x00, 0xff, 0x00), LV_STATE_DEFAULT);
+			// Desacelerou
+			else if (v < vel_antiga)
+			lv_obj_set_style_text_color(labelVelocidade, lv_color_make(0xff, 0x00, 0x00), LV_STATE_DEFAULT);						vel_antiga = v;		}
 	}
 }
 
+static void taskVelocidade(void *pvParameters) {
+	
+	
+	for (;;) {
+		
+		
+	}
+	
+}
 
 /************************************************************************/
 /* configs                                                              */
 /************************************************************************/
+ 
+ static void RTT_init(float freqPrescale, uint32_t IrqNPulses, uint32_t rttIRQSource) {
+
+ uint16_t pllPreScale = (int) (((float) 32768) / freqPrescale);
+ 
+ rtt_sel_source(RTT, false);
+ rtt_init(RTT, pllPreScale);
+ 
+ if (rttIRQSource & RTT_MR_ALMIEN) {
+ uint32_t ul_previous_time;
+ ul_previous_time = rtt_read_timer_value(RTT);
+ while (ul_previous_time == rtt_read_timer_value(RTT));
+ rtt_write_alarm_time(RTT, IrqNPulses+ul_previous_time);
+ }
+
+ /* config NVIC */
+ NVIC_DisableIRQ(RTT_IRQn);
+ NVIC_ClearPendingIRQ(RTT_IRQn);
+ NVIC_SetPriority(RTT_IRQn, 4);
+ NVIC_EnableIRQ(RTT_IRQn);
+
+ /* Enable RTT interrupt */
+ if (rttIRQSource & (RTT_MR_RTTINCIEN | RTT_MR_ALMIEN))
+ rtt_enable_interrupt(RTT, rttIRQSource);
+ else
+ rtt_disable_interrupt(RTT, RTT_MR_RTTINCIEN | RTT_MR_ALMIEN);
+ 
+ }
+
+void io_init(void) {
+	pmc_enable_periph_clk(SENSOR_PIO_ID);
+
+	pio_configure(SENSOR_PIO_ID, PIO_INPUT, SENSOR_IDX_MASK, PIO_DEFAULT);
+	pio_pull_up(SENSOR_PIO,SENSOR_IDX_MASK,0);
+	
+	pio_handler_set(SENSOR_PIO, SENSOR_PIO_ID, SENSOR_IDX_MASK, PIO_IT_FALL_EDGE,
+	velocidade_callback);
+
+	pio_enable_interrupt(SENSOR_PIO, SENSOR_IDX_MASK);
+
+	pio_get_interrupt_status(SENSOR_PIO);
+
+
+	NVIC_EnableIRQ(SENSOR_PIO_ID);
+	NVIC_SetPriority(SENSOR_PIO_ID, 4);
+}
+
+
 static void configure_lcd(void) {
 	/**LCD pin configure on SPI*/
 	pio_configure_pin(LCD_SPI_MISO_PIO, LCD_SPI_MISO_FLAGS);  //
@@ -411,21 +432,6 @@ static void configure_console(void) {
 	setbuf(stdout, NULL);
 }
 
-void TC_init(Tc *TC, int ID_TC, int TC_CHANNEL, int freq) {
-// 	uint32_t ul_div;
-// 	uint32_t ul_tcclks;
-// 	uint32_t ul_sysclk = sysclk_get_cpu_hz();
-// 
-// 	pmc_enable_periph_clk(ID_TC);
-// 
-// 	tc_find_mck_divisor(freq, ul_sysclk, &ul_div, &ul_tcclks, ul_sysclk);
-// 	tc_init(TC, TC_CHANNEL, ul_tcclks | TC_CMR_CPCTRG);
-// 	tc_write_rc(TC, TC_CHANNEL, (ul_sysclk / ul_div) / freq);
-// 
-// 	NVIC_SetPriority((IRQn_Type)ID_TC, 4);
-// 	NVIC_EnableIRQ((IRQn_Type)ID_TC);
-// 	tc_enable_interrupt(TC, TC_CHANNEL, TC_IER_CPCS);
-}
 
 void RTC_init(Rtc *rtc, uint32_t id_rtc, calendar t, uint32_t irq_type){
 	/* Configura o PMC */
@@ -506,6 +512,17 @@ int main(void) {
 	configure_lcd();
 	configure_touch();
 	configure_lvgl();
+	
+	xQueueRTC = xQueueCreate(32, sizeof(uint32_t));
+	if (xQueueRTC == NULL)
+	printf("falha em criar a queue RTC\n");
+	
+	xQueueDeltaT = xQueueCreate(100, sizeof(int));
+	if (xQueueDeltaT == NULL)
+	printf("falha em criar a queue RTC\n");
+	
+	xSemaphoreClock = xSemaphoreCreateBinary();
+	xSemaphoreMutex = xSemaphoreCreateMutex();
 
 	/* Create task to control oled */
 	if (xTaskCreate(task_lcd, "LCD", TASK_LCD_STACK_SIZE, NULL, TASK_LCD_STACK_PRIORITY, NULL) != pdPASS) {
@@ -515,14 +532,11 @@ int main(void) {
 	if (xTaskCreate(task_RTC, "RTC", TASK_LCD_STACK_SIZE, NULL, TASK_LCD_STACK_PRIORITY, NULL) != pdPASS) {
 		printf("Failed to create rtc task\r\n");
 	}
-	
-	xQueueRTC = xQueueCreate(32, sizeof(uint32_t));
-	if (xQueueRTC == NULL)
-	printf("falha em criar a queue RTC\n");
-	
-	xSemaphoreClock = xSemaphoreCreateBinary();
-	xSemaphore = xSemaphoreCreateBinary();
-	
+	 	
+// 	if (xTaskCreate(taskVelocidade, "velocidade", TASK_LCD_STACK_SIZE, NULL, TASK_LCD_STACK_PRIORITY, NULL) != pdPASS) {
+// 		printf("Failed to create velocidade task\r\n");
+// 	}
+
 	/* Start the scheduler. */
 	vTaskStartScheduler();
 
